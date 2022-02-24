@@ -302,17 +302,24 @@ fn get_ava(
     res
 }
 
-fn accumulate_depth(s: usize, e: usize, depth: &mut [u32]){
+fn accumulate_depth(s: usize, e: usize, depth: &mut [u32]) {
     for v in depth.iter_mut().take(e + 1).skip(s) {
         *v += 1;
     }
 }
 
-fn get_min_depth(s: usize, e: usize, depth: &[u32]) -> u32{
-    *depth[s..e+1].iter().min().unwrap_or(&0)
+fn get_min_depth(s: usize, e: usize, depth: &[u32]) -> u32 {
+    *depth[s..e + 1].iter().min().unwrap_or(&0)
 }
 
-fn out_sorted_paf(mut pafs: Vec<Paf>, q: &Q, fid: u32, fcount: u32, fdepth: u32, depth: &mut Vec<u32>){
+fn out_sorted_paf(
+    mut pafs: Vec<Paf>,
+    q: &Q,
+    fid: u32,
+    fcount: u32,
+    fdepth: u32,
+    depth: &mut Vec<u32>,
+) {
     pafs.sort_unstable_by(|a, b| (b.1 - b.0).cmp(&(a.1 - a.0))); //reversed sort by overlapping length
     let mut c = 0;
     if fdepth > 0 {
@@ -325,7 +332,7 @@ fn out_sorted_paf(mut pafs: Vec<Paf>, q: &Q, fid: u32, fcount: u32, fdepth: u32,
             let (s, e) = (i.0 as usize >> BIN, i.1 as usize >> BIN);
             if get_min_depth(s, e, depth) < fdepth {
                 accumulate_depth(s, e, depth);
-            }else {
+            } else {
                 continue;
             }
         }
@@ -349,12 +356,12 @@ fn out_sorted_paf(mut pafs: Vec<Paf>, q: &Q, fid: u32, fcount: u32, fdepth: u32,
     }
 }
 
-fn filt_pafs_by_count(pafs: &mut Vec<Paf>, fcount: u32){
+fn filt_pafs_by_count(pafs: &mut Vec<Paf>, fcount: u32) {
     pafs.sort_unstable_by(|a, b| (b.1 - b.0).cmp(&(a.1 - a.0))); //reversed sort by overlapping length
     (*pafs).truncate(fcount as usize);
 }
 
-fn filt_pafs_by_depth(pafs: &mut Vec<Paf>, len: usize, fdepth: u32, depth: &mut Vec<u32>){
+fn filt_pafs_by_depth(pafs: &mut Vec<Paf>, len: usize, fdepth: u32, depth: &mut Vec<u32>) {
     pafs.sort_unstable_by(|a, b| (b.1 - b.0).cmp(&(a.1 - a.0))); //reversed sort by overlapping length
     depth.resize((len >> BIN) + 1, 0);
     depth.fill(0);
@@ -363,7 +370,7 @@ fn filt_pafs_by_depth(pafs: &mut Vec<Paf>, len: usize, fdepth: u32, depth: &mut 
         if get_min_depth(s, e, depth) < fdepth {
             accumulate_depth(s, e, depth);
             true
-        }else {
+        } else {
             false
         }
     });
@@ -377,7 +384,7 @@ fn out_ava(
     ffra: f32,
     fcount: u32,
     fdepth: u32,
-    depth_buf: &mut Vec<u32> // buffer to caculate overlapping depth for each query
+    depth_buf: &mut Vec<u32>, // buffer to caculate overlapping depth for each query
 ) {
     let f = buf.pop_front().unwrap();
     let fid = f.qid;
@@ -385,7 +392,8 @@ fn out_ava(
     for b in buf {
         let bid = b.qid;
         let bname = &q.names[bid as usize];
-        if b.tid != f.tid || b.ts > f.te {//out range
+        if b.tid != f.tid || b.ts > f.te {
+            //out range
             break;
         } else if fid == bid {
             continue;
@@ -415,7 +423,7 @@ fn out_ava(
                 (qs2, qe2)
             };
             let std = f.flag & REVERSE == b.flag & REVERSE;
-            if fcount <= 0 && fdepth <= 0 {
+            if fcount == 0 && fdepth == 0 {
                 println!(
                     "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     q.names[fid as usize].name,
@@ -428,29 +436,34 @@ fn out_ava(
                     qs2,
                     qe2 + 1,
                 )
-            }else {
+            } else {
                 let paf = (qs1, qe1 + 1, std, bid, qs2, qe2 + 1);
                 let rev_paf = (qs2, qe2 + 1, std, fid, qs1, qe1 + 1);
                 let pafs_v = pafs.entry(fid).or_insert(Vec::new());
                 pafs_v.push(paf);
-                if fcount > 0 && pafs_v.len() as u32 > fcount * 5 {// filter to reduce RAM
+                if fcount > 0 && pafs_v.len() as u32 > fcount * 5 {
+                    // filter to reduce RAM
                     filt_pafs_by_count(pafs_v, fcount);
                 }
-                if fdepth > 0 && pafs_v.len() as u32 > fdepth * 10 {// filter to reduce RAM
+                if fdepth > 0 && pafs_v.len() as u32 > fdepth * 10 {
+                    // filter to reduce RAM
                     filt_pafs_by_depth(pafs_v, fname.len, fdepth, depth_buf);
                 }
                 let pafs_v = pafs.entry(bid).or_insert(Vec::new());
                 pafs_v.push(rev_paf);
-                if fcount > 0 && pafs_v.len() as u32 > fcount * 5 {// filter to reduce RAM
+                if fcount > 0 && pafs_v.len() as u32 > fcount * 5 {
+                    // filter to reduce RAM
                     filt_pafs_by_count(pafs_v, fcount);
                 }
-                if fdepth > 0 && pafs_v.len() as u32 > fdepth * 10 {// filter to reduce RAM
-                    filt_pafs_by_depth(pafs_v, bname.len , fdepth, depth_buf);
+                if fdepth > 0 && pafs_v.len() as u32 > fdepth * 10 {
+                    // filter to reduce RAM
+                    filt_pafs_by_depth(pafs_v, bname.len, fdepth, depth_buf);
                 }
             }
         }
     }
-    if f.flag & SPLIT == 0 {//skip split mappings, which should be merged before sort and output
+    if f.flag & SPLIT == 0 {
+        //skip split mappings, which should be merged before sort and output
         if let Some(v) = pafs.remove(&fid) {
             out_sorted_paf(v, q, fid, fcount, fdepth, depth_buf);
         }
@@ -463,7 +476,11 @@ fn main() {
         .about("A tool to convert read-to-ref mapping to read-vs-read overlapping")
         .arg_required_else_help(true)
         .global_setting(AppSettings::DeriveDisplayOrder)
-        .arg(Arg::new("input").required(true).help("input sorted bam/sam file"))
+        .arg(
+            Arg::new("input")
+                .required(true)
+                .help("input sorted bam/sam file"),
+        )
         .arg(
             Arg::new("length")
                 .short('l')
@@ -534,7 +551,7 @@ fn main() {
             if r.is_reverse() {
                 b.flag |= REVERSE;
             }
-            if r.aux(b"SA").is_ok(){
+            if r.aux(b"SA").is_ok() {
                 b.flag |= SPLIT;
             }
             buf.push_back(b);
@@ -542,7 +559,16 @@ fn main() {
             let f = buf.front().unwrap();
             let b = buf.back().unwrap();
             if b.tid != f.tid || b.ts > f.te {
-                out_ava(&mut buf, &mut pafs, &mut q, flen, ffra, fcount, fdepth, &mut depth_buf);
+                out_ava(
+                    &mut buf,
+                    &mut pafs,
+                    &mut q,
+                    flen,
+                    ffra,
+                    fcount,
+                    fdepth,
+                    &mut depth_buf,
+                );
             }
         }
         pre_tid = r.tid();
@@ -550,7 +576,16 @@ fn main() {
     }
 
     while !buf.is_empty() {
-        out_ava(&mut buf, &mut pafs, &mut q, flen, ffra, fcount, fdepth, &mut depth_buf);
+        out_ava(
+            &mut buf,
+            &mut pafs,
+            &mut q,
+            flen,
+            ffra,
+            fcount,
+            fdepth,
+            &mut depth_buf,
+        );
     }
 
     // for records with split mapping
