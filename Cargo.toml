@@ -1,5 +1,5 @@
 [package]
-name = "bam2ava"
+name = "map2ava"
 version = "0.1.0"
 edition = "2021"
 
@@ -9,4 +9,3 @@ edition = "2021"
 rust-htslib = "0.38"
 hashbrown = "0.11"
 clap = "3.1"
-
