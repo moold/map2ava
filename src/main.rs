@@ -24,7 +24,8 @@ struct Block {
 }
 
 // an alignment block
-static REVERSE: u8 = 0b0000_0001; // reverse flag
+const REVERSE: u8 = 0b0000_0001; // reverse flag
+const SPLIT: u8 = 0b0000_0010; // split mapping flag
 #[derive(Debug)]
 struct Aln {
     flag: u8,
@@ -71,6 +72,8 @@ impl Q {
     }
 }
 
+// split an alignment block to continuous aligned blocks without RefSkip (`N`) cigar
+// for iso-seq data
 fn split_to_blocks(p: i64, cigar: &CigarStringView) -> Vec<Block> {
     let mut blocks: Vec<Block> = Vec::new();
     let mut qs = 0;
@@ -139,6 +142,7 @@ fn split_to_blocks(p: i64, cigar: &CigarStringView) -> Vec<Block> {
     blocks
 }
 
+//get read matched pos using ref pos, skip gap
 fn get_read_matched_pos(tp: i64, qs: i32, ts: i64, cigar: &[Cigar], is_start: bool) -> i32 {
     let mut qe = qs - 1;
     let mut te = ts - 1;
@@ -269,7 +273,7 @@ fn get_ava(
             }
         }
 
-        if ts != te && qs1 >= 0 && qe1 >= 0 && qs2 >= 0 && qe2 >= 0 {
+        if ts != te && qs1 >= 0 && qe1 >= qs1 && qs2 >= 0 && qe2 >= qs2 {
             ovls.push((qs1, qe1, qs2, qe2));
         }
     }
@@ -298,26 +302,82 @@ fn get_ava(
     res
 }
 
-fn get_min_depth(s: usize, e: usize, depth: &mut [u32]) -> u32 {
-    let mut d = u32::MAX;
-    // for i in s..e+1 {
+fn accumulate_depth(s: usize, e: usize, depth: &mut [u32]){
     for v in depth.iter_mut().take(e + 1).skip(s) {
         *v += 1;
-        if *v < d {
-            d = *v;
+    }
+}
+
+fn get_min_depth(s: usize, e: usize, depth: &[u32]) -> u32{
+    *depth[s..e+1].iter().min().unwrap_or(&0)
+}
+
+fn out_sorted_paf(mut pafs: Vec<Paf>, q: &Q, fid: u32, fcount: u32, fdepth: u32, depth: &mut Vec<u32>){
+    pafs.sort_unstable_by(|a, b| (b.1 - b.0).cmp(&(a.1 - a.0))); //reversed sort by overlapping length
+    let mut c = 0;
+    if fdepth > 0 {
+        depth.resize((q.names[fid as usize].len >> BIN) + 1, 0);
+        depth.fill(0);
+    }
+
+    for i in pafs {
+        if fdepth > 0 {
+            let (s, e) = (i.0 as usize >> BIN, i.1 as usize >> BIN);
+            if get_min_depth(s, e, depth) < fdepth {
+                accumulate_depth(s, e, depth);
+            }else {
+                continue;
+            }
+        }
+
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            q.names[fid as usize].name,
+            q.names[fid as usize].len,
+            i.0,
+            i.1,
+            if i.2 { '-' } else { '+' },
+            q.names[i.3 as usize].name,
+            q.names[i.3 as usize].len,
+            i.4,
+            i.5,
+        );
+        c += 1;
+        if fcount > 0 && c >= fcount {
+            break;
         }
     }
-    d
+}
+
+fn filt_pafs_by_count(pafs: &mut Vec<Paf>, fcount: u32){
+    pafs.sort_unstable_by(|a, b| (b.1 - b.0).cmp(&(a.1 - a.0))); //reversed sort by overlapping length
+    (*pafs).truncate(fcount as usize);
+}
+
+fn filt_pafs_by_depth(pafs: &mut Vec<Paf>, len: usize, fdepth: u32, depth: &mut Vec<u32>){
+    pafs.sort_unstable_by(|a, b| (b.1 - b.0).cmp(&(a.1 - a.0))); //reversed sort by overlapping length
+    depth.resize((len >> BIN) + 1, 0);
+    depth.fill(0);
+    pafs.retain(|&i| {
+        let (s, e) = (i.0 as usize >> BIN, i.1 as usize >> BIN);
+        if get_min_depth(s, e, depth) < fdepth {
+            accumulate_depth(s, e, depth);
+            true
+        }else {
+            false
+        }
+    });
 }
 
 fn out_ava(
     buf: &mut VecDeque<Aln>,
-    avas: &mut HashMap<u32, Vec<Paf>>,
+    pafs: &mut HashMap<u32, Vec<Paf>>,
     q: &mut Q,
     flen: i32,
     ffra: f32,
     fcount: u32,
     fdepth: u32,
+    depth_buf: &mut Vec<u32> // buffer to caculate overlapping depth for each query
 ) {
     let f = buf.pop_front().unwrap();
     let fid = f.qid;
@@ -325,7 +385,7 @@ fn out_ava(
     for b in buf {
         let bid = b.qid;
         let bname = &q.names[bid as usize];
-        if b.tid != f.tid || b.ts > f.te {
+        if b.tid != f.tid || b.ts > f.te {//out range
             break;
         } else if fid == bid {
             continue;
@@ -343,55 +403,56 @@ fn out_ava(
                 continue;
             }
 
-            let (qs1, qe1) = if f.flag & REVERSE == 1 {
+            let (qs1, qe1) = if f.flag & REVERSE > 0 {
                 (fname.len as i32 - qe1 - 1, fname.len as i32 - qs1 - 1)
             } else {
                 (qs1, qe1)
             };
 
-            let (qs2, qe2) = if b.flag & REVERSE == 1 {
+            let (qs2, qe2) = if b.flag & REVERSE > 0 {
                 (bname.len as i32 - qe2 - 1, bname.len as i32 - qs2 - 1)
             } else {
                 (qs2, qe2)
             };
             let std = f.flag & REVERSE == b.flag & REVERSE;
-            let ava = (qs1, qe1 + 1, std, bid, qs2, qe2 + 1);
-            let rev_ava = (qs2, qe2 + 1, std, fid, qs1, qe1 + 1);
-            avas.entry(fid).or_insert(Vec::new()).push(ava);
-            avas.entry(bid).or_insert(Vec::new()).push(rev_ava);
+            if fcount <= 0 && fdepth <= 0 {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    q.names[fid as usize].name,
+                    q.names[fid as usize].len,
+                    qs1,
+                    qe1 + 1,
+                    if std { '-' } else { '+' },
+                    q.names[bid as usize].name,
+                    q.names[bid as usize].len,
+                    qs2,
+                    qe2 + 1,
+                )
+            }else {
+                let paf = (qs1, qe1 + 1, std, bid, qs2, qe2 + 1);
+                let rev_paf = (qs2, qe2 + 1, std, fid, qs1, qe1 + 1);
+                let pafs_v = pafs.entry(fid).or_insert(Vec::new());
+                pafs_v.push(paf);
+                if fcount > 0 && pafs_v.len() as u32 > fcount * 5 {// filter to reduce RAM
+                    filt_pafs_by_count(pafs_v, fcount);
+                }
+                if fdepth > 0 && pafs_v.len() as u32 > fdepth * 10 {// filter to reduce RAM
+                    filt_pafs_by_depth(pafs_v, fname.len, fdepth, depth_buf);
+                }
+                let pafs_v = pafs.entry(bid).or_insert(Vec::new());
+                pafs_v.push(rev_paf);
+                if fcount > 0 && pafs_v.len() as u32 > fcount * 5 {// filter to reduce RAM
+                    filt_pafs_by_count(pafs_v, fcount);
+                }
+                if fdepth > 0 && pafs_v.len() as u32 > fdepth * 10 {// filter to reduce RAM
+                    filt_pafs_by_depth(pafs_v, bname.len , fdepth, depth_buf);
+                }
+            }
         }
     }
-
-    if let Some(mut v) = avas.remove(&fid) {
-        v.sort_unstable_by(|a, b| (b.1 - b.0).cmp(&(a.1 - a.0))); //reversed sort by overlapping length
-        let mut c = 0;
-        let mut depth: Vec<u32> = if fdepth > 0 {
-            vec![0; (q.names[fid as usize].len >> BIN) + 1]
-        } else {
-            Vec::new()
-        };
-        for i in v {
-            if fdepth > 0
-                && get_min_depth(i.0 as usize >> BIN, i.1 as usize >> BIN, &mut depth) > fdepth
-            {
-                continue;
-            }
-            println!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                q.names[fid as usize].name,
-                q.names[fid as usize].len,
-                i.0,
-                i.1,
-                if i.2 { '-' } else { '+' },
-                q.names[i.3 as usize].name,
-                q.names[i.3 as usize].len,
-                i.4,
-                i.5,
-            );
-            c += 1;
-            if fcount > 0 && c >= fcount {
-                break;
-            }
+    if f.flag & SPLIT == 0 {//skip split mappings, which should be merged before sort and output
+        if let Some(v) = pafs.remove(&fid) {
+            out_sorted_paf(v, q, fid, fcount, fdepth, depth_buf);
         }
     }
 }
@@ -402,12 +463,13 @@ fn main() {
         .about("A tool to convert read-to-ref mapping to read-vs-read overlapping")
         .arg_required_else_help(true)
         .global_setting(AppSettings::DeriveDisplayOrder)
-        .arg(Arg::new("input").required(true).help("input file"))
+        .arg(Arg::new("input").required(true).help("input sorted bam/sam file"))
         .arg(
             Arg::new("length")
                 .short('l')
                 .long("length")
                 .value_name("INT.FLOAT")
+                // .default_value("10.")
                 .help("discard a record if overlap length < min(INT, FLOAT * read_length)")
                 .takes_value(true),
         )
@@ -434,6 +496,7 @@ fn main() {
     let (flen, ffra) = (_len as i32, _len.fract());
     let fcount: u32 = args.value_of_t("count").unwrap_or(0);
     let fdepth: u32 = args.value_of_t("depth").unwrap_or(0);
+    let mut depth_buf: Vec<u32> = Vec::new();
 
     let mut bam = Reader::from_path(infile).unwrap();
     let mut r = Record::new();
@@ -441,7 +504,7 @@ fn main() {
     let mut q = Q::new();
     let (mut pre_tid, mut pre_pos) = (0, 0);
 
-    let mut avas: HashMap<u32, Vec<Paf>> = HashMap::with_capacity(5000);
+    let mut pafs: HashMap<u32, Vec<Paf>> = HashMap::with_capacity(5000);
     while let Some(ret) = bam.read(&mut r) {
         ret.expect("BAM/SAM parsing failed!");
         if r.is_unmapped() {
@@ -471,12 +534,15 @@ fn main() {
             if r.is_reverse() {
                 b.flag |= REVERSE;
             }
+            if r.aux(b"SA").is_ok(){
+                b.flag |= SPLIT;
+            }
             buf.push_back(b);
 
             let f = buf.front().unwrap();
             let b = buf.back().unwrap();
             if b.tid != f.tid || b.ts > f.te {
-                out_ava(&mut buf, &mut avas, &mut q, flen, ffra, fcount, fdepth);
+                out_ava(&mut buf, &mut pafs, &mut q, flen, ffra, fcount, fdepth, &mut depth_buf);
             }
         }
         pre_tid = r.tid();
@@ -484,6 +550,11 @@ fn main() {
     }
 
     while !buf.is_empty() {
-        out_ava(&mut buf, &mut avas, &mut q, flen, ffra, fcount, fdepth);
+        out_ava(&mut buf, &mut pafs, &mut q, flen, ffra, fcount, fdepth, &mut depth_buf);
+    }
+
+    // for records with split mapping
+    for (fid, pafs) in pafs.into_iter() {
+        out_sorted_paf(pafs, &q, fid, fcount, fdepth, &mut depth_buf);
     }
 }
