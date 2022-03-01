@@ -320,7 +320,7 @@ fn out_sorted_paf(
     fdepth: u32,
     depth: &mut Vec<u32>,
 ) {
-    pafs.sort_unstable_by(|a, b| (b.1 - b.0).cmp(&(a.1 - a.0))); //reversed sort by overlapping length
+    pafs.sort_unstable_by_key(|k| k.0 - k.1);//reversed sort by overlapping length
     let mut c = 0;
     if fdepth > 0 {
         depth.resize((q.names[fid as usize].len >> BIN) + 1, 0);
@@ -343,7 +343,7 @@ fn out_sorted_paf(
             q.names[fid as usize].len,
             i.0,
             i.1,
-            if i.2 { '-' } else { '+' },
+            if i.2 { '+' } else { '-' },
             q.names[i.3 as usize].name,
             q.names[i.3 as usize].len,
             i.4,
@@ -357,12 +357,12 @@ fn out_sorted_paf(
 }
 
 fn filt_pafs_by_count(pafs: &mut Vec<Paf>, fcount: u32) {
-    pafs.sort_unstable_by(|a, b| (b.1 - b.0).cmp(&(a.1 - a.0))); //reversed sort by overlapping length
+    pafs.sort_unstable_by_key(|k| k.0 - k.1);//reversed sort by overlapping length
     (*pafs).truncate(fcount as usize);
 }
 
 fn filt_pafs_by_depth(pafs: &mut Vec<Paf>, len: usize, fdepth: u32, depth: &mut Vec<u32>) {
-    pafs.sort_unstable_by(|a, b| (b.1 - b.0).cmp(&(a.1 - a.0))); //reversed sort by overlapping length
+    pafs.sort_unstable_by_key(|k| k.0 - k.1);//reversed sort by overlapping length
     depth.resize((len >> BIN) + 1, 0);
     depth.fill(0);
     pafs.retain(|&i| {
@@ -430,7 +430,7 @@ fn out_ava(
                     q.names[fid as usize].len,
                     qs1,
                     qe1 + 1,
-                    if std { '-' } else { '+' },
+                    if std { '+' } else { '-' },
                     q.names[bid as usize].name,
                     q.names[bid as usize].len,
                     qs2,
