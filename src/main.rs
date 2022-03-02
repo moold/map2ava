@@ -198,7 +198,10 @@ fn get_ava(
             } else if c2.ts <= c1.ts && c1.ts <= c2.te && c2.te <= c1.te {
                 ts = c1.ts;
                 te = c2.te;
-                qs1 = c1.qs;
+                qs1 = match cg1.0[c1.cs] {
+                    Cigar::Match(_) => c1.qs,
+                    _ => get_read_matched_pos(ts, c1.qs, c1.ts, &cg1.0[c1.cs..c1.ce], true),
+                };
                 qs2 = get_read_matched_pos(ts, c2.qs, c2.ts, &cg2.0[c2.cs..c2.ce], true);
                 while (qs1 < 0 && qs2 >= 0) || (qs1 >= 0 && qs2 < 0) {
                     ts -= min(qs1, qs2) as i64;
@@ -207,7 +210,10 @@ fn get_ava(
                 }
 
                 qe1 = get_read_matched_pos(te, c1.qs, c1.ts, &cg1.0[c1.cs..c1.ce], false);
-                qe2 = c2.qe;
+                qe2 = match cg2.0[c2.ce - 1] {
+                    Cigar::Match(_) => c2.qe,
+                    _ => get_read_matched_pos(te, c2.qs, c2.ts, &cg2.0[c2.cs..c2.ce], false),
+                };
                 while (qe1 < 0 && qe2 >= 0) || (qe1 >= 0 && qe2 < 0) {
                     te += min(qe1, qe2) as i64;
                     qe1 = get_read_matched_pos(te, c1.qs, c1.ts, &cg1.0[c1.cs..c1.ce], false);
@@ -216,7 +222,10 @@ fn get_ava(
             } else if c2.ts <= c1.ts && c2.te >= c1.te {
                 ts = c1.ts;
                 te = c1.te;
-                qs1 = c1.qs;
+                qs1 = match cg1.0[c1.cs] {
+                    Cigar::Match(_) => c1.qs,
+                    _ => get_read_matched_pos(ts, c1.qs, c1.ts, &cg1.0[c1.cs..c1.ce], true),
+                };
                 qs2 = get_read_matched_pos(ts, c2.qs, c2.ts, &cg2.0[c2.cs..c2.ce], true);
                 while (qs1 < 0 && qs2 >= 0) || (qs1 >= 0 && qs2 < 0) {
                     ts -= min(qs1, qs2) as i64;
@@ -224,7 +233,10 @@ fn get_ava(
                     qs2 = get_read_matched_pos(ts, c2.qs, c2.ts, &cg2.0[c2.cs..c2.ce], true);
                 }
 
-                qe1 = c1.qe;
+                qe1 = match cg1.0[c1.ce - 1] {
+                    Cigar::Match(_) => c1.qe,
+                    _ => get_read_matched_pos(te, c1.qs, c1.ts, &cg1.0[c1.cs..c1.ce], false),
+                };
                 qe2 = get_read_matched_pos(te, c2.qs, c2.ts, &cg2.0[c2.cs..c2.ce], false);
                 while (qe1 < 0 && qe2 >= 0) || (qe1 >= 0 && qe2 < 0) {
                     te += min(qe1, qe2) as i64;
@@ -235,7 +247,10 @@ fn get_ava(
                 ts = c2.ts;
                 te = c2.te;
                 qs1 = get_read_matched_pos(ts, c1.qs, c1.ts, &cg1.0[c1.cs..c1.ce], true);
-                qs2 = c2.qs;
+                qs2 = match cg2.0[c2.ce - 1] {
+                    Cigar::Match(_) => c2.qs,
+                    _ => get_read_matched_pos(ts, c2.qs, c2.ts, &cg2.0[c2.cs..c2.ce], true),
+                };
                 while (qs1 < 0 && qs2 >= 0) || (qs1 >= 0 && qs2 < 0) {
                     ts -= min(qs1, qs2) as i64;
                     qs1 = get_read_matched_pos(ts, c1.qs, c1.ts, &cg1.0[c1.cs..c1.ce], true);
@@ -243,7 +258,10 @@ fn get_ava(
                 }
 
                 qe1 = get_read_matched_pos(te, c1.qs, c1.ts, &cg1.0[c1.cs..c1.ce], false);
-                qe2 = c2.qe;
+                qe2 = match cg2.0[c2.ce - 1] {
+                    Cigar::Match(_) => c2.qe,
+                    _ => get_read_matched_pos(te, c2.qs, c2.ts, &cg2.0[c2.cs..c2.ce], false),
+                };
                 while (qe1 < 0 && qe2 >= 0) || (qe1 >= 0 && qe2 < 0) {
                     te += min(qe1, qe2) as i64;
                     qe1 = get_read_matched_pos(te, c1.qs, c1.ts, &cg1.0[c1.cs..c1.ce], false);
@@ -253,7 +271,10 @@ fn get_ava(
                 ts = c2.ts;
                 te = c1.te;
                 qs1 = get_read_matched_pos(ts, c1.qs, c1.ts, &cg1.0[c1.cs..c1.ce], true);
-                qs2 = c2.qs;
+                qs2 = match cg2.0[c2.ce - 1] {
+                    Cigar::Match(_) => c2.qs,
+                    _ => get_read_matched_pos(ts, c2.qs, c2.ts, &cg2.0[c2.cs..c2.ce], true),
+                };
                 // println!("ts: {} qs1:{:?} qs2:{}",ts, qs1, qs2 );
                 while (qs1 < 0 && qs2 >= 0) || (qs1 >= 0 && qs2 < 0) {
                     ts -= min(qs1, qs2) as i64;
@@ -261,7 +282,10 @@ fn get_ava(
                     qs2 = get_read_matched_pos(ts, c2.qs, c2.ts, &cg2.0[c2.cs..c2.ce], true);
                 }
 
-                qe1 = c1.qe;
+                qe1 = match cg1.0[c1.ce - 1] {
+                    Cigar::Match(_) => c1.qe,
+                    _ => get_read_matched_pos(te, c1.qs, c1.ts, &cg1.0[c1.cs..c1.ce], false),
+                };
                 qe2 = get_read_matched_pos(te, c2.qs, c2.ts, &cg2.0[c2.cs..c2.ce], false);
                 while (qe1 < 0 && qe2 >= 0) || (qe1 >= 0 && qe2 < 0) {
                     te += min(qe1, qe2) as i64;
@@ -482,6 +506,15 @@ fn main() {
                 .help("input sorted bam/sam file"),
         )
         .arg(
+            Arg::new("mapq")
+                .short('q')
+                .long("mapq")
+                .value_name("INT")
+                .default_value("1")
+                .help("minimum mapping quality, alignments with a lower mapping quality are ignored.")
+                .takes_value(true),
+        )
+        .arg(
             Arg::new("length")
                 .short('l')
                 .long("length")
@@ -509,6 +542,7 @@ fn main() {
         .get_matches();
 
     let infile = args.value_of("input").expect("Missing input file!");
+    let fqual: u8 = args.value_of_t("mapq").unwrap();
     let _len: f32 = args.value_of_t("length").unwrap_or(0.);
     let (flen, ffra) = (_len as i32, _len.fract());
     let fcount: u32 = args.value_of_t("count").unwrap_or(0);
@@ -524,7 +558,7 @@ fn main() {
     let mut pafs: HashMap<u32, Vec<Paf>> = HashMap::with_capacity(5000);
     while let Some(ret) = bam.read(&mut r) {
         ret.expect("BAM/SAM parsing failed!");
-        if r.is_unmapped() {
+        if r.is_unmapped() || r.mapq() < fqual {
             continue;
         }
         assert!(
