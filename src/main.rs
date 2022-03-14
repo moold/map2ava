@@ -1,14 +1,28 @@
 use clap::{AppSettings, Arg, Command};
+use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_utils::{atomic::AtomicCell, thread};
 use hashbrown::HashMap;
+#[cfg(not(target_env = "msvc"))]
+use jemallocator::Jemalloc;
 use rust_htslib::bam::{
     ext::BamRecordExtensions, record::Cigar, record::CigarStringView, Read, Reader, Record,
 };
-use std::{cmp::min, collections::VecDeque, rc::Rc, string::String};
+use std::{
+    cmp::min,
+    io::{self, Write},
+    string::String,
+    sync::Arc,
+};
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 //version number
 const VERSION: &str = include_str!(concat!(env!("OUT_DIR"), "/VERSION"));
 const BIN: u32 = 6; // 2^^6 == 64
-
+//number of records for each batch reading
+const BATCH: usize = 2_000_000;
 //qs, qe, rev, tid, ts, te
 type Paf = (i32, i32, bool, u32, i32, i32);
 
@@ -39,13 +53,13 @@ struct Aln {
 
 // convert qname:String => qname:usize
 struct Name {
-    name: Rc<String>,
+    name: Arc<String>,
     len: usize,
 }
 
 struct Q {
     names: Vec<Name>,
-    idxs: HashMap<Rc<String>, u32>, //(name, index in names)
+    idxs: HashMap<Arc<String>, u32>, //(name, index in names)
 }
 
 impl Q {
@@ -57,7 +71,7 @@ impl Q {
     }
 
     fn get_idx(&mut self, name: impl Into<String>, len: usize) -> u32 {
-        let name = Rc::new(name.into());
+        let name = Arc::new(name.into());
         if self.idxs.contains_key(&name) {
             *self.idxs.get(&name).unwrap()
         } else {
@@ -185,14 +199,8 @@ fn get_ava(
 ) -> Vec<(i32, i32, i32, i32)> {
     let mut ovls: Vec<(i32, i32, i32, i32)> = Vec::new();
     for c1 in bk1 {
-        let mut ts = 0;
-        let mut te = 0;
-        let mut qs1 = 0;
-        let mut qe1 = 0;
-        let mut qs2 = 0;
-        let mut qe2 = 0;
-
         for c2 in bk2 {
+            let (mut ts, mut te, mut qs1, mut qe1, mut qs2, mut qe2);
             if c2.te <= c1.ts {
                 continue;
             } else if c2.ts <= c1.ts && c1.ts <= c2.te && c2.te <= c1.te {
@@ -247,7 +255,7 @@ fn get_ava(
                 ts = c2.ts;
                 te = c2.te;
                 qs1 = get_read_matched_pos(ts, c1.qs, c1.ts, &cg1.0[c1.cs..c1.ce], true);
-                qs2 = match cg2.0[c2.ce - 1] {
+                qs2 = match cg2.0[c2.cs] {
                     Cigar::Match(_) => c2.qs,
                     _ => get_read_matched_pos(ts, c2.qs, c2.ts, &cg2.0[c2.cs..c2.ce], true),
                 };
@@ -271,7 +279,7 @@ fn get_ava(
                 ts = c2.ts;
                 te = c1.te;
                 qs1 = get_read_matched_pos(ts, c1.qs, c1.ts, &cg1.0[c1.cs..c1.ce], true);
-                qs2 = match cg2.0[c2.ce - 1] {
+                qs2 = match cg2.0[c2.cs] {
                     Cigar::Match(_) => c2.qs,
                     _ => get_read_matched_pos(ts, c2.qs, c2.ts, &cg2.0[c2.cs..c2.ce], true),
                 };
@@ -295,16 +303,12 @@ fn get_ava(
             } else {
                 break;
             }
-        }
 
-        if ts != te && qs1 >= 0 && qe1 >= qs1 && qs2 >= 0 && qe2 >= qs2 {
-            ovls.push((qs1, qe1, qs2, qe2));
+            if ts != te && qs1 >= 0 && qe1 >= qs1 && qs2 >= 0 && qe2 >= qs2 {
+                ovls.push((qs1, qe1, qs2, qe2));
+            }
         }
     }
-
-    // for i in &ovls{
-    //     println!("{:?}", i);
-    // }
 
     let mut res: Vec<(i32, i32, i32, i32)> = Vec::new();
     if !ovls.is_empty() {
@@ -343,14 +347,16 @@ fn out_sorted_paf(
     fcount: u32,
     fdepth: u32,
     depth: &mut Vec<u32>,
+    s: Option<&Sender<(u32, Vec<Paf>)>>,
 ) {
-    pafs.sort_unstable_by_key(|k| k.0 - k.1);//reversed sort by overlapping length
+    pafs.sort_unstable_by_key(|k| k.0 - k.1); //reversed sort by overlapping length
     let mut c = 0;
     if fdepth > 0 {
         depth.resize((q.names[fid as usize].len >> BIN) + 1, 0);
         depth.fill(0);
     }
 
+    let mut ret = (fid, Vec::new()); //TODO change to map
     for i in pafs {
         if fdepth > 0 {
             let (s, e) = (i.0 as usize >> BIN, i.1 as usize >> BIN);
@@ -360,33 +366,41 @@ fn out_sorted_paf(
                 continue;
             }
         }
-
-        println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            q.names[fid as usize].name,
-            q.names[fid as usize].len,
-            i.0,
-            i.1,
-            if i.2 { '+' } else { '-' },
-            q.names[i.3 as usize].name,
-            q.names[i.3 as usize].len,
-            i.4,
-            i.5,
-        );
+        if s.is_some() {
+            ret.1.push(i);
+        } else {
+            let f = &q.names[fid as usize];
+            let r = &q.names[i.3 as usize];
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                f.name,
+                f.len,
+                i.0,
+                i.1,
+                if i.2 { '+' } else { '-' },
+                r.name,
+                r.len,
+                i.4,
+                i.5,
+            );
+        }
         c += 1;
         if fcount > 0 && c >= fcount {
             break;
         }
     }
+    if !ret.1.is_empty() {
+        s.unwrap().send(ret).unwrap();
+    }
 }
 
 fn filt_pafs_by_count(pafs: &mut Vec<Paf>, fcount: u32) {
-    pafs.sort_unstable_by_key(|k| k.0 - k.1);//reversed sort by overlapping length
+    pafs.sort_unstable_by_key(|k| k.0 - k.1); //reversed sort by overlapping length
     (*pafs).truncate(fcount as usize);
 }
 
 fn filt_pafs_by_depth(pafs: &mut Vec<Paf>, len: usize, fdepth: u32, depth: &mut Vec<u32>) {
-    pafs.sort_unstable_by_key(|k| k.0 - k.1);//reversed sort by overlapping length
+    pafs.sort_unstable_by_key(|k| k.0 - k.1); //reversed sort by overlapping length
     depth.resize((len >> BIN) + 1, 0);
     depth.fill(0);
     pafs.retain(|&i| {
@@ -400,98 +414,204 @@ fn filt_pafs_by_depth(pafs: &mut Vec<Paf>, len: usize, fdepth: u32, depth: &mut 
     });
 }
 
-fn out_ava(
-    buf: &mut VecDeque<Aln>,
+fn caculate_ava(
+    f: &Aln,
+    b: &Aln,
+    fname: &Name,
+    bname: &Name,
     pafs: &mut HashMap<u32, Vec<Paf>>,
-    q: &mut Q,
+    depth_buf: &mut Vec<u32>, // buffer to caculate overlapping depth for each query
     flen: i32,
     ffra: f32,
     fcount: u32,
     fdepth: u32,
-    depth_buf: &mut Vec<u32>, // buffer to caculate overlapping depth for each query
+    s: &Sender<(u32, Vec<Paf>)>,
 ) {
-    let f = buf.pop_front().unwrap();
-    let fid = f.qid;
-    let fname = &q.names[fid as usize];
-    for b in buf {
-        let bid = b.qid;
-        let bname = &q.names[bid as usize];
-        if b.tid != f.tid || b.ts > f.te {
-            //out range
-            break;
-        } else if fid == bid {
+    for (qs1, qe1, qs2, qe2) in get_ava(&f.blocks, &f.cigar, &b.blocks, &b.cigar) {
+        if flen > 0 && min(qe1 - qs1 + 1, qe2 - qs2 + 1) < flen {
             continue;
         }
 
-        for (qs1, qe1, qs2, qe2) in get_ava(&f.blocks, &f.cigar, &b.blocks, &b.cigar) {
-            if flen > 0 && min(qe1 - qs1 + 1, qe2 - qs2 + 1) < flen {
-                continue;
+        if ffra > 0.
+            && (qe1 - qs1 < (ffra * (fname.len as f32)) as i32
+                || qe2 - qs2 < (ffra * (bname.len as f32)) as i32)
+        {
+            continue;
+        }
+
+        let (qs1, qe1) = if f.flag & REVERSE > 0 {
+            (fname.len as i32 - qe1 - 1, fname.len as i32 - qs1 - 1)
+        } else {
+            (qs1, qe1)
+        };
+
+        let (qs2, qe2) = if b.flag & REVERSE > 0 {
+            (bname.len as i32 - qe2 - 1, bname.len as i32 - qs2 - 1)
+        } else {
+            (qs2, qe2)
+        };
+        let std = f.flag & REVERSE == b.flag & REVERSE;
+        if fcount == 0 && fdepth == 0 {
+            s.send((f.qid, vec![(qs1, qe1 + 1, std, b.qid, qs2, qe2 + 1)]))
+                .unwrap();
+        } else {
+            let paf = (qs1, qe1 + 1, std, b.qid, qs2, qe2 + 1);
+            let pafs_v = pafs.entry(f.qid).or_insert(Vec::new());
+            pafs_v.push(paf);
+            if fcount > 0 && pafs_v.len() as u32 > fcount * 5 {
+                // filter to reduce RAM
+                filt_pafs_by_count(pafs_v, fcount);
             }
-
-            if ffra > 0.
-                && (qe1 - qs1 < (ffra * (fname.len as f32)) as i32
-                    || qe2 - qs2 < (ffra * (bname.len as f32)) as i32)
-            {
-                continue;
-            }
-
-            let (qs1, qe1) = if f.flag & REVERSE > 0 {
-                (fname.len as i32 - qe1 - 1, fname.len as i32 - qs1 - 1)
-            } else {
-                (qs1, qe1)
-            };
-
-            let (qs2, qe2) = if b.flag & REVERSE > 0 {
-                (bname.len as i32 - qe2 - 1, bname.len as i32 - qs2 - 1)
-            } else {
-                (qs2, qe2)
-            };
-            let std = f.flag & REVERSE == b.flag & REVERSE;
-            if fcount == 0 && fdepth == 0 {
-                println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                    q.names[fid as usize].name,
-                    q.names[fid as usize].len,
-                    qs1,
-                    qe1 + 1,
-                    if std { '+' } else { '-' },
-                    q.names[bid as usize].name,
-                    q.names[bid as usize].len,
-                    qs2,
-                    qe2 + 1,
-                )
-            } else {
-                let paf = (qs1, qe1 + 1, std, bid, qs2, qe2 + 1);
-                let rev_paf = (qs2, qe2 + 1, std, fid, qs1, qe1 + 1);
-                let pafs_v = pafs.entry(fid).or_insert(Vec::new());
-                pafs_v.push(paf);
-                if fcount > 0 && pafs_v.len() as u32 > fcount * 5 {
-                    // filter to reduce RAM
-                    filt_pafs_by_count(pafs_v, fcount);
-                }
-                if fdepth > 0 && pafs_v.len() as u32 > fdepth * 10 {
-                    // filter to reduce RAM
-                    filt_pafs_by_depth(pafs_v, fname.len, fdepth, depth_buf);
-                }
-                let pafs_v = pafs.entry(bid).or_insert(Vec::new());
-                pafs_v.push(rev_paf);
-                if fcount > 0 && pafs_v.len() as u32 > fcount * 5 {
-                    // filter to reduce RAM
-                    filt_pafs_by_count(pafs_v, fcount);
-                }
-                if fdepth > 0 && pafs_v.len() as u32 > fdepth * 10 {
-                    // filter to reduce RAM
-                    filt_pafs_by_depth(pafs_v, bname.len, fdepth, depth_buf);
-                }
+            if fdepth > 0 && pafs_v.len() as u32 > fdepth * 10 {
+                // filter to reduce RAM
+                filt_pafs_by_depth(pafs_v, fname.len, fdepth, depth_buf);
             }
         }
     }
-    if f.flag & SPLIT == 0 {
-        //skip split mappings, which should be merged before sort and output
-        if let Some(v) = pafs.remove(&fid) {
-            out_sorted_paf(v, q, fid, fcount, fdepth, depth_buf);
+}
+
+// find the first Aln index overlapping with f
+fn find_starti(buf: &[Aln], f: &Aln, fsi: usize) -> usize {
+    for (i, b) in buf.iter().enumerate().skip(fsi) {
+        if b.tid == f.tid && b.te >= f.ts {
+            return i;
         }
     }
+    fsi
+}
+
+fn out_ava_thread(
+    buf: &[Aln],
+    g_pafs: &mut HashMap<u32, Vec<Paf>>,
+    q: &Q,
+    flen: i32,
+    ffra: f32,
+    fcount: u32,
+    fdepth: u32,
+    thread: usize,
+    buf_i: usize,
+    is_last: bool,
+) -> usize {
+    let no_overlap = fcount == 0 && fdepth == 0;
+    let valid_len = if is_last {
+        buf.len()
+    } else {
+        find_starti(buf, buf.last().unwrap(), 0)
+    };
+
+    thread::scope(|work| {
+        let buf_i = Arc::new(AtomicCell::new(buf_i));
+        let (ou_s, ou_r): (Sender<(u32, Vec<Paf>)>, Receiver<(u32, Vec<Paf>)>) = bounded(1024);
+        work.spawn(move |_| {
+            // output thread
+            let stdout = io::stdout();
+            let lock = stdout.lock();
+            let mut w = io::BufWriter::with_capacity(1024000, lock);
+            while let Ok((fid, pafs)) = ou_r.recv() {
+                let f = &q.names[fid as usize];
+                for paf in pafs {
+                    let r = &q.names[paf.3 as usize];
+                    writeln!(
+                        w,
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        f.name,
+                        f.len,
+                        paf.0,
+                        paf.1,
+                        if paf.2 { '+' } else { '-' },
+                        r.name,
+                        r.len,
+                        paf.4,
+                        paf.5,
+                    )
+                    .unwrap();
+                }
+            }
+        });
+
+        work.spawn(move |_| {
+            //work thread
+            thread::scope(|scoped| {
+                let mut handles = Vec::with_capacity(thread);
+                for _i in 0..thread {
+                    let buf_i = buf_i.clone();
+                    let ou_s = ou_s.clone();
+                    let handle = scoped.spawn(move |_| {
+                        let mut fsi = 0;
+                        let mut depth_buf: Vec<u32> = Vec::with_capacity(500);
+                        // reads with split mappings
+                        let mut pafs: HashMap<u32, Vec<Paf>> = HashMap::with_capacity(500);
+                        // qids with pafs in g_pafs from previous batch
+                        let mut idx = buf_i.fetch_add(1);
+                        while idx < valid_len {
+                            let f = &buf[idx];
+                            if no_overlap {
+                                fsi = idx + 1;
+                            }
+                            let mut fsi_updated = false;
+                            for (j, b) in buf.iter().enumerate().skip(fsi) {
+                                //find the leftmost boundary for the next f
+                                if (!fsi_updated) && (b.tid == f.tid && b.te >= f.ts) {
+                                    fsi = j;
+                                    fsi_updated = true;
+                                }
+
+                                if b.tid > f.tid || b.ts > f.te {
+                                    break;
+                                } else if f.qid == b.qid || b.tid < f.tid || b.te < f.ts {
+                                    continue;
+                                }
+
+                                caculate_ava(
+                                    f,
+                                    b,
+                                    &q.names[f.qid as usize],
+                                    &q.names[b.qid as usize],
+                                    &mut pafs,
+                                    &mut depth_buf,
+                                    flen,
+                                    ffra,
+                                    fcount,
+                                    fdepth,
+                                    &ou_s,
+                                );
+                            }
+                            if f.flag & SPLIT == 0 {
+                                if let Some(v) = pafs.remove(&f.qid) {
+                                    out_sorted_paf(
+                                        v,
+                                        q,
+                                        f.qid,
+                                        fcount,
+                                        fdepth,
+                                        &mut depth_buf,
+                                        Some(&ou_s),
+                                    );
+                                }
+                            }
+                            idx = buf_i.fetch_add(1);
+                        }
+                        pafs
+                    });
+                    handles.push(handle);
+                }
+
+                // wait all threads finish and get results
+                let res: Vec<HashMap<u32, Vec<Paf>>> =
+                    handles.into_iter().map(|h| h.join().unwrap()).collect();
+                for pafs in res {
+                    // save records without output
+                    for (k, v) in pafs {
+                        g_pafs.entry(k).or_insert(Vec::new()).extend(v);
+                    }
+                }
+            })
+            .unwrap();
+        });
+    })
+    .unwrap();
+
+    valid_len
 }
 
 fn main() {
@@ -506,12 +626,23 @@ fn main() {
                 .help("input sorted bam/sam file"),
         )
         .arg(
+            Arg::new("thread")
+                .short('t')
+                .long("thread")
+                .value_name("INT")
+                .default_value("3")
+                .help("number of threads.")
+                .takes_value(true),
+        )
+        .arg(
             Arg::new("mapq")
                 .short('q')
                 .long("mapq")
                 .value_name("INT")
                 .default_value("1")
-                .help("minimum mapping quality, alignments with a lower mapping quality are ignored.")
+                .help(
+                    "minimum mapping quality, alignments with a lower mapping quality are ignored.",
+                )
                 .takes_value(true),
         )
         .arg(
@@ -542,16 +673,17 @@ fn main() {
         .get_matches();
 
     let infile = args.value_of("input").expect("Missing input file!");
+    let thread: usize = args.value_of_t("thread").unwrap();
     let fqual: u8 = args.value_of_t("mapq").unwrap();
     let _len: f32 = args.value_of_t("length").unwrap_or(0.);
     let (flen, ffra) = (_len as i32, _len.fract());
     let fcount: u32 = args.value_of_t("count").unwrap_or(0);
     let fdepth: u32 = args.value_of_t("depth").unwrap_or(0);
-    let mut depth_buf: Vec<u32> = Vec::new();
 
     let mut bam = Reader::from_path(infile).unwrap();
     let mut r = Record::new();
-    let mut buf: VecDeque<Aln> = VecDeque::new();
+    let mut buf: Vec<Aln> = Vec::with_capacity(BATCH);
+    let mut buf_i = 0;
     let mut q = Q::new();
     let (mut pre_tid, mut pre_pos) = (0, 0);
 
@@ -588,42 +720,27 @@ fn main() {
             if r.aux(b"SA").is_ok() {
                 b.flag |= SPLIT;
             }
-            buf.push_back(b);
-
-            let f = buf.front().unwrap();
-            let b = buf.back().unwrap();
-            if b.tid != f.tid || b.ts > f.te {
-                out_ava(
-                    &mut buf,
-                    &mut pafs,
-                    &mut q,
-                    flen,
-                    ffra,
-                    fcount,
-                    fdepth,
-                    &mut depth_buf,
+            buf.push(b);
+            if buf.len() > BATCH {
+                buf_i = out_ava_thread(
+                    &buf, &mut pafs, &q, flen, ffra, fcount, fdepth, thread, buf_i, false,
                 );
+                let skip_len = find_starti(&buf, &buf[buf_i], 0);
+                buf.drain(..skip_len);
+                buf_i -= skip_len;
             }
+            pre_tid = r.tid();
+            pre_pos = r.reference_start();
         }
-        pre_tid = r.tid();
-        pre_pos = r.reference_start();
     }
-
-    while !buf.is_empty() {
-        out_ava(
-            &mut buf,
-            &mut pafs,
-            &mut q,
-            flen,
-            ffra,
-            fcount,
-            fdepth,
-            &mut depth_buf,
+    if !buf.is_empty() {
+        out_ava_thread(
+            &buf, &mut pafs, &q, flen, ffra, fcount, fdepth, thread, buf_i, true,
         );
     }
-
     // for records with split mapping
+    let mut depth_buf: Vec<u32> = Vec::with_capacity(500);
     for (fid, pafs) in pafs.into_iter() {
-        out_sorted_paf(pafs, &q, fid, fcount, fdepth, &mut depth_buf);
+        out_sorted_paf(pafs, &q, fid, fcount, fdepth, &mut depth_buf, None);
     }
 }
