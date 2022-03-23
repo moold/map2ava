@@ -556,9 +556,9 @@ fn out_ava_thread(
                                     fsi_updated = true;
                                 }
 
-                                if b.tid > f.tid || b.ts > f.te {
+                                if b.tid > f.tid || (b.tid == f.tid && b.ts > f.te) {
                                     break;
-                                } else if f.qid == b.qid || b.tid < f.tid || b.te < f.ts {
+                                } else if f.qid == b.qid || b.tid < f.tid || (b.tid == f.tid && b.te < f.ts) {
                                     continue;
                                 }
 
