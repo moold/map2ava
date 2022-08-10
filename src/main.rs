@@ -2,8 +2,6 @@ use clap::{AppSettings, Arg, Command};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use crossbeam_utils::{atomic::AtomicCell, thread};
 use hashbrown::HashMap;
-#[cfg(not(target_env = "msvc"))]
-use jemallocator::Jemalloc;
 use rust_htslib::bam::{
     ext::BamRecordExtensions, record::Cigar, record::CigarStringView, Read, Reader, Record,
 };
@@ -15,13 +13,16 @@ use std::{
 };
 
 #[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
 //version number
 const VERSION: &str = include_str!(concat!(env!("OUT_DIR"), "/VERSION"));
 const BIN: u32 = 6; // 2^^6 == 64
-//number of records for each batch reading
+                    //number of records for each batch reading
 const BATCH: usize = 2_000_000;
 //qs, qe, rev, tid, ts, te
 type Paf = (i32, i32, bool, u32, i32, i32);
@@ -558,7 +559,10 @@ fn out_ava_thread(
 
                                 if b.tid > f.tid || (b.tid == f.tid && b.ts > f.te) {
                                     break;
-                                } else if f.qid == b.qid || b.tid < f.tid || (b.tid == f.tid && b.te < f.ts) {
+                                } else if f.qid == b.qid
+                                    || b.tid < f.tid
+                                    || (b.tid == f.tid && b.te < f.ts)
+                                {
                                     continue;
                                 }
 
@@ -646,9 +650,20 @@ fn main() {
                 .takes_value(true),
         )
         .arg(
-            Arg::new("length")
+            Arg::new("len")
                 .short('l')
-                .long("length")
+                .long("len")
+                .value_name("INT")
+                .default_value("0")
+                .help(
+                    "minimum read length, reads with length < INT are ignored.",
+                )
+                .takes_value(true),
+        )
+        .arg(
+            Arg::new("maplen")
+                .short('L')
+                .long("maplen")
                 .value_name("INT.FLOAT")
                 // .default_value("10.")
                 .help("discard a record if overlap length < min(INT, FLOAT * read_length)")
@@ -660,12 +675,14 @@ fn main() {
                 .long("count")
                 .value_name("INT")
                 .help("only output the longest INT records for each query")
+                .hide(true)
                 .takes_value(true),
         )
         .arg(
             Arg::new("depth")
                 .short('d')
                 .long("depth")
+                .hide(true)
                 .value_name("INT")
                 .help("only output the longest INT fold records for each query")
                 .takes_value(true),
@@ -675,7 +692,8 @@ fn main() {
     let infile = args.value_of("input").expect("Missing input file!");
     let thread: usize = args.value_of_t("thread").unwrap();
     let fqual: u8 = args.value_of_t("mapq").unwrap();
-    let _len: f32 = args.value_of_t("length").unwrap_or(0.);
+    let frlen: usize = args.value_of_t("len").unwrap();
+    let _len: f32 = args.value_of_t("maplen").unwrap_or(0.);
     let (flen, ffra) = (_len as i32, _len.fract());
     let fcount: u32 = args.value_of_t("count").unwrap_or(0);
     let fdepth: u32 = args.value_of_t("depth").unwrap_or(0);
@@ -690,7 +708,8 @@ fn main() {
     let mut pafs: HashMap<u32, Vec<Paf>> = HashMap::with_capacity(5000);
     while let Some(ret) = bam.read(&mut r) {
         ret.expect("BAM/SAM parsing failed!");
-        if r.is_unmapped() || r.mapq() < fqual {
+        let rlen = r.seq_len_from_cigar(true);
+        if r.is_unmapped() || r.mapq() < fqual || rlen < frlen {
             continue;
         }
         assert!(
@@ -703,7 +722,7 @@ fn main() {
             let blocks = split_to_blocks(r.reference_start(), &cigar);
             let qid = q.get_idx(
                 String::from_utf8(r.qname().to_vec()).unwrap(),
-                r.seq_len_from_cigar(true),
+                rlen,
             );
             let mut b = Aln {
                 flag: 0,

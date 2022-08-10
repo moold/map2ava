@@ -13,4 +13,4 @@ crossbeam-utils = "0.8"
 crossbeam-channel = "0.5"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
-jemallocator = "0.3.2"
+tikv-jemallocator = "0.5"
